@@ -6,8 +6,11 @@ import os
 import sqlite3
 import sys
 import time
+import threading
 from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from socketserver import ThreadingMixIn
 from typing import Optional
 
 import cv2
@@ -17,11 +20,16 @@ from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -29,6 +37,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QWidget,
     QStackedWidget,
+    QGraphicsDropShadowEffect,
 )
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -45,6 +54,154 @@ except Exception:  # pragma: no cover
 
 
 log = logging.getLogger("local_app_monitor")
+
+
+class _FrameStore:
+    """Thread-safe store for the latest JPEG frame for MJPEG streaming."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._jpeg: bytes | None = None
+
+    def update_bgr(self, frame: np.ndarray) -> None:
+        """Encode a BGR frame as JPEG and store it.
+
+        Called from the LiveWorker thread. We keep only the most recent frame.
+        """
+        try:
+            ok, buf = cv2.imencode(".jpg", frame)
+        except Exception:
+            return
+        if not ok:
+            return
+        data = buf.tobytes()
+        with self._lock:
+            self._jpeg = data
+
+    def get_jpeg(self) -> bytes | None:
+        with self._lock:
+            return self._jpeg
+
+
+_FRAME_STORE = _FrameStore()
+
+
+class _ThreadedHTTPServer(ThreadingMixIn, HTTPServer):  # type: ignore[misc]
+    """HTTP server that handles each request in its own thread."""
+
+    daemon_threads = True
+
+
+class _MJPEGRequestHandler(BaseHTTPRequestHandler):
+    """Very small MJPEG streaming handler serving /stream.
+
+    This is designed for LAN use only. It exposes the latest frame from
+    _FRAME_STORE as a multipart/x-mixed-replace stream.
+    """
+
+    server_version = "LocalMJPEG/0.1"
+
+    def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
+        if self.path.split("?")[0] != "/stream":
+            self.send_error(404, "Not found")
+            return
+
+        self.send_response(200)
+        self.send_header("Age", "0")
+        self.send_header("Cache-Control", "no-cache, private")
+        self.send_header("Pragma", "no-cache")
+        boundary = "frame"
+        self.send_header(
+            "Content-Type",
+            f"multipart/x-mixed-replace; boundary={boundary}",
+        )
+        self.end_headers()
+
+        try:
+            while True:
+                jpeg = _FRAME_STORE.get_jpeg()
+                if jpeg is None:
+                    time.sleep(0.03)
+                    continue
+
+                try:
+                    self.wfile.write(b"--" + boundary.encode("ascii") + b"\r\n")
+                    self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                    self.wfile.write(
+                        f"Content-Length: {len(jpeg)}\r\n\r\n".encode("ascii")
+                    )
+                    self.wfile.write(jpeg)
+                    self.wfile.write(b"\r\n")
+                except BrokenPipeError:
+                    break
+                except Exception:  # pragma: no cover - logging only
+                    log.exception("MJPEG stream write failed")
+                    break
+
+                # Small sleep to avoid spinning too fast; ~30 FPS at 0.03s
+                time.sleep(0.03)
+        except Exception:  # pragma: no cover - logging only
+            log.exception("MJPEG handler error")
+
+    def log_message(self, format: str, *args) -> None:  # noqa: A003
+        # Reduce console noise; log at debug level instead of stdout.
+        log.debug("MJPEG: " + format, *args)
+
+
+_STREAM_HTTPD: _ThreadedHTTPServer | None = None
+
+
+def start_stream_server_if_enabled() -> None:
+    """Start the MJPEG HTTP server in a background thread if enabled.
+
+    Controlled by LOCAL_STREAM_ENABLED (default 0/disabled).
+    Optional envs:
+      - LOCAL_STREAM_PORT (default 8090)
+      - LOCAL_STREAM_HOST (default 0.0.0.0)
+    """
+    global _STREAM_HTTPD
+
+    enabled_raw = os.getenv("LOCAL_STREAM_ENABLED", "0").strip().lower()
+    if enabled_raw in ("", "0", "false", "no"):  # feature explicitly disabled
+        log.info("MJPEG stream server disabled (set LOCAL_STREAM_ENABLED=1 to enable)")
+        return
+
+    if _STREAM_HTTPD is not None:
+        return
+
+    try:
+        port = int(os.getenv("LOCAL_STREAM_PORT", "8090"))
+    except Exception:
+        port = 8090
+    host = os.getenv("LOCAL_STREAM_HOST", "0.0.0.0").strip() or "0.0.0.0"
+
+    try:
+        httpd = _ThreadedHTTPServer((host, port), _MJPEGRequestHandler)
+    except OSError as exc:
+        log.error("Failed to start MJPEG server on %s:%d: %s", host, port, exc)
+        return
+
+    _STREAM_HTTPD = httpd
+
+    def _serve() -> None:
+        log.info("Starting MJPEG stream server on http://%s:%d/stream", host, port)
+        try:
+            httpd.serve_forever()
+        except Exception:  # pragma: no cover - logging only
+            log.exception("MJPEG server crashed")
+
+    thread = threading.Thread(target=_serve, name="mjpeg-server", daemon=True)
+    thread.start()
+
+
+def stop_stream_server() -> None:
+    global _STREAM_HTTPD
+    if _STREAM_HTTPD is not None:
+        try:
+            _STREAM_HTTPD.shutdown()
+        except Exception:
+            log.exception("Failed to shut down MJPEG server cleanly")
+        _STREAM_HTTPD = None
 
 
 def get_preferred_device() -> str:
@@ -100,6 +257,17 @@ class LiveWorker(QThread):
         self._last_has_part = False
         self._last_has_defect = False
 
+        # Cache for drawing bounding boxes on every frame so they don't
+        # disappear between inference frames. We also hold them briefly
+        # after detections stop to reduce flicker.
+        self._last_part_boxes: list[tuple[int, int, int, int, float]] = []
+        self._last_defect_boxes: list[tuple[int, int, int, int, float]] = []
+        self._no_detection_since_time: float | None = None
+        try:
+            self._box_hold_seconds = float(os.getenv("LOCAL_BOX_HOLD_SECONDS", "0.3"))
+        except Exception:
+            self._box_hold_seconds = 0.3
+
     def stop(self) -> None:
         self._running = False
 
@@ -125,12 +293,15 @@ class LiveWorker(QThread):
 
 
 
-        cap = cv2.VideoCapture("/dev/video2", cv2.CAP_V4L2)    # Very Important Check Cam Index by running v4l2-ctl --list-devices
 
-
-
-
-
+        WIDTH = 1280
+        HEIGHT = 720
+        TARGET_FPS = 30
+        cap = cv2.VideoCapture("/dev/video0", cv2.CAP_V4L2)    # Very Important Check Cam Index by running v4l2-ctl --list-devices
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+        cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
 
 
 
@@ -172,6 +343,14 @@ class LiveWorker(QThread):
         except Exception:
             infer_stride = 2
 
+        # How often to push frames into the MJPEG streaming buffer.
+        try:
+            stream_stride = int(os.getenv("LOCAL_STREAM_STRIDE", "1"))
+            if stream_stride < 1:
+                stream_stride = 1
+        except Exception:
+            stream_stride = 1
+
         last_time = time.monotonic()
 
         try:
@@ -193,6 +372,13 @@ class LiveWorker(QThread):
 
                 has_part = self._last_has_part
                 has_defect = self._last_has_defect
+                detection_updated = False
+
+                # If we don't have a part model, treat "part present" as false
+                # so the defect model never runs. This enforces a strict
+                # "part then defect" pipeline.
+                if part_model is None:
+                    has_part = False
 
                 if run_inference and part_model is not None:
                     try:
@@ -211,11 +397,13 @@ class LiveWorker(QThread):
                         has_part = False
                     else:
                         pres = part_results[0]
-                        if getattr(pres, "boxes", None) is None or len(pres.boxes) == 0:
+                        part_boxes = self._extract_boxes(pres)
+                        if not part_boxes:
                             has_part = False
                         else:
                             has_part = True
-                            frame = self._draw_part_boxes(frame, pres)
+                            self._last_part_boxes = part_boxes
+                            detection_updated = True
 
                 if run_inference and has_part and defect_model is not None:
                     try:
@@ -232,16 +420,37 @@ class LiveWorker(QThread):
 
                     if results:
                         res = results[0]
-                        if getattr(res, "boxes", None) is not None and len(res.boxes) > 0:
+                        defect_boxes = self._extract_boxes(res)
+                        if defect_boxes:
                             has_defect = True
+                            self._last_defect_boxes = defect_boxes
+                            detection_updated = True
                         else:
                             has_defect = False
-                        frame = self._draw_defect_boxes(frame, res)
+
+                # Update box hold timer used by _draw_cached_boxes
+                if detection_updated:
+                    self._no_detection_since_time = None
+                elif self._no_detection_since_time is None:
+                    self._no_detection_since_time = now
 
                 # Cache last known detection state so non-inference frames
                 # still emit a meaningful signal for the jitter logic.
                 self._last_has_part = has_part
                 self._last_has_defect = has_defect
+
+                # Draw cached boxes on every frame so bounding boxes don't
+                # flicker when inference is skipped.
+                frame = self._draw_cached_boxes(frame, now)
+
+                # Optionally publish this frame into the MJPEG buffer for
+                # the Edge Device live feed. We only encode every
+                # LOCAL_STREAM_STRIDE frames to keep CPU usage manageable.
+                if stream_stride > 0 and (self._frame_index % stream_stride) == 0:
+                    try:
+                        _FRAME_STORE.update_bgr(frame)
+                    except Exception:
+                        log.debug("Failed to update MJPEG frame store", exc_info=True)
 
                 self.detection_state.emit(has_part, has_defect)
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -264,10 +473,14 @@ class LiveWorker(QThread):
             cap.release()
 
     @staticmethod
-    def _draw_part_boxes(frame: np.ndarray, res) -> np.ndarray:
-        """Draw part detections (from the part model) in blue."""
+    def _extract_boxes(res) -> list[tuple[int, int, int, int, float]]:
+        """Convert a YOLO result object into a simple list of boxes.
+
+        Each entry is (x1, y1, x2, y2, conf).
+        """
+        boxes_out: list[tuple[int, int, int, int, float]] = []
         if not hasattr(res, "boxes") or res.boxes is None:
-            return frame
+            return boxes_out
 
         for box in res.boxes:
             try:
@@ -277,39 +490,20 @@ class LiveWorker(QThread):
             except Exception:
                 continue
 
-            color = (255, 0, 0)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            label = f"part {conf:.2f}"
-            cv2.putText(
-                frame,
-                label,
-                (x1, max(0, y1 - 5)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                color,
-                1,
-                cv2.LINE_AA,
-            )
+            boxes_out.append((x1, y1, x2, y2, conf))
 
-        return frame
+        return boxes_out
 
     @staticmethod
-    def _draw_defect_boxes(frame: np.ndarray, res) -> np.ndarray:
-        """Draw defect detections (from the defect model) in red."""
-        if not hasattr(res, "boxes") or res.boxes is None:
-            return frame
-
-        for box in res.boxes:
-            try:
-                xyxy = box.xyxy[0].cpu().numpy().astype(int)
-                conf = float(box.conf[0]) if hasattr(box, "conf") else 0.0
-                x1, y1, x2, y2 = xyxy.tolist()
-            except Exception:
-                continue
-
-            color = (0, 0, 255)
+    def _draw_boxes(
+        frame: np.ndarray,
+        boxes: list[tuple[int, int, int, int, float]],
+        color: tuple[int, int, int],
+        label_prefix: str,
+    ) -> np.ndarray:
+        for x1, y1, x2, y2, conf in boxes:
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            label = f"def {conf:.2f}"
+            label = f"{label_prefix} {conf:.2f}"
             cv2.putText(
                 frame,
                 label,
@@ -320,8 +514,82 @@ class LiveWorker(QThread):
                 1,
                 cv2.LINE_AA,
             )
-
         return frame
+
+    def _draw_cached_boxes(self, frame: np.ndarray, now: float) -> np.ndarray:
+        """Draw the last detected part/defect boxes on every frame.
+
+        Boxes are kept for a short time (LOCAL_BOX_HOLD_SECONDS) after
+        detections disappear to avoid visible flicker.
+        """
+        if self._no_detection_since_time is not None:
+            if (now - self._no_detection_since_time) > self._box_hold_seconds:
+                self._last_part_boxes = []
+                self._last_defect_boxes = []
+                self._no_detection_since_time = None
+
+        frame = self._draw_boxes(frame, self._last_part_boxes, (255, 0, 0), "part")
+        frame = self._draw_boxes(frame, self._last_defect_boxes, (0, 0, 255), "def")
+        return frame
+
+
+class ModelSelectionDialog(QDialog):
+    """Simple dialog to choose a trained VisionM model to save locally.
+
+    It lists models returned from /api/models for the current company/project
+    and exposes the chosen modelId via `selected_model_id` when accepted.
+    """
+
+    def __init__(self, models: list[dict], parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Select VisionM model")
+        self.resize(460, 320)
+        self._models = models
+        self.selected_model_id: Optional[str] = None
+
+        layout = QVBoxLayout(self)
+
+        info = QLabel(
+            "Select a trained model for this company/project and click Save "
+            "to download it into the current folder."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        self.list_widget = QListWidget(self)
+        for m in models:
+            version = m.get("modelVersion") or "v?"
+            status = m.get("status") or "completed"
+            created = m.get("createdAt") or ""
+            metrics = m.get("metrics") or {}
+            m_ap = metrics.get("mAP50")
+            if isinstance(m_ap, (int, float)):
+                metrics_str = f"  mAP50={m_ap:.2f}"
+            else:
+                metrics_str = ""
+            label = f"{version}  [{status}]  {created}{metrics_str}"
+            self.list_widget.addItem(QListWidgetItem(label))
+        layout.addWidget(self.list_widget)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Close, parent=self)
+        buttons.accepted.connect(self._on_save_clicked)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_save_clicked(self) -> None:
+        row = self.list_widget.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "No selection", "Please select a model first.")
+            return
+
+        model = self._models[row]
+        model_id = model.get("modelId")
+        if not model_id:
+            QMessageBox.warning(self, "Invalid model", "Selected entry has no modelId.")
+            return
+
+        self.selected_model_id = str(model_id)
+        self.accept()
 
 
 class MainWindow(QMainWindow):
@@ -329,18 +597,20 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Local – Live View")
         self.resize(1280, 720)
-        self.setStyleSheet(
-            """
+
+        # Theme stylesheets (dark / light). Buttons stay customized in both.
+        self._dark_stylesheet = """
             QMainWindow {
                 background-color: #111111;
             }
             QLabel {
                 color: #f5f5f5;
+                font-size: 13px;
             }
             QComboBox {
                 background-color: #202020;
-                border: 1px solid #404040;
-                border-radius: 4px;
+                border: 1px solid #444444;
+                border-radius: 6px;
                 padding: 4px 8px;
                 color: #f5f5f5;
             }
@@ -351,22 +621,27 @@ class MainWindow(QMainWindow):
             }
             QWidget#InfoPanel {
                 background-color: #181818;
-                border-radius: 8px;
+                border-radius: 10px;
                 border: 1px solid #303030;
             }
             QPushButton {
                 background-color: #202020;
                 border: 1px solid #404040;
-                border-radius: 4px;
-                padding: 4px 10px;
+                border-radius: 20px;
+                padding: 6px 14px;
                 color: #f5f5f5;
+                font-weight: 500;
             }
             QPushButton:hover {
                 background-color: #2a2a2a;
             }
+            QPushButton:pressed {
+                background-color: #1e1e1e;
+            }
             QPushButton:checked {
                 background-color: #3f51b5;
                 border-color: #5c6bc0;
+                color: #ffffff;
             }
             QTableWidget {
                 background-color: #181818;
@@ -375,16 +650,83 @@ class MainWindow(QMainWindow):
                 color: #f5f5f5;
                 selection-background-color: #333333;
                 selection-color: #ffffff;
+                border-radius: 6px;
             }
             QHeaderView::section {
                 background-color: #202020;
                 color: #f5f5f5;
                 padding: 3px 6px;
                 border: 1px solid #303030;
+                font-weight: 500;
             }
-            """
-        )
+        """
 
+        self._light_stylesheet = """
+            QMainWindow {
+                background-color: #f5f5f5;
+            }
+            QLabel {
+                color: #111111;
+                font-size: 13px;
+            }
+            QComboBox {
+                background-color: #ffffff;
+                border: 1px solid #cccccc;
+                border-radius: 6px;
+                padding: 4px 8px;
+                color: #111111;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #ffffff;
+                color: #111111;
+                selection-background-color: #eeeeee;
+            }
+            QWidget#InfoPanel {
+                background-color: #ffffff;
+                border-radius: 10px;
+                border: 1px solid #dddddd;
+            }
+            QPushButton {
+                background-color: #ffffff;
+                border: 1px solid #cccccc;
+                border-radius: 20px;
+                padding: 6px 14px;
+                color: #111111;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background-color: #f0f0f0;
+            }
+            QPushButton:pressed {
+                background-color: #e0e0e0;
+            }
+            QPushButton:checked {
+                background-color: #3f51b5;
+                border-color: #5c6bc0;
+                color: #ffffff;
+            }
+            QTableWidget {
+                background-color: #ffffff;
+                alternate-background-color: #f7f7f7;
+                gridline-color: #dddddd;
+                color: #111111;
+                selection-background-color: #e0e0ff;
+                selection-color: #111111;
+                border-radius: 6px;
+            }
+            QHeaderView::section {
+                background-color: #f0f0f0;
+                color: #111111;
+                padding: 3px 6px;
+                border: 1px solid #dddddd;
+                font-weight: 500;
+            }
+        """
+
+        self._dark_mode = True
+        self.setStyleSheet(self._dark_stylesheet)
+
+        # Ensure label colors are consistent with the initial theme
         self._worker: Optional[LiveWorker] = None
         # Single-camera index (no dropdown). Change here if you want a different
         # default camera, e.g. 1 for external USB webcam.
@@ -508,6 +850,12 @@ class MainWindow(QMainWindow):
         self.defect_model_combo.currentIndexChanged.connect(self._on_model_changed)
         info_layout.addWidget(self.part_model_combo, row - 1, 1)
         info_layout.addWidget(self.defect_model_combo, row, 1)
+        row += 1
+
+        # Button to browse trained models from the VisionM backend
+        self.fetch_model_button = QPushButton("Browse VisionM models")
+        self.fetch_model_button.clicked.connect(self._browse_visionm_models)
+        info_layout.addWidget(self.fetch_model_button, row, 1)
         row += 1
         flag_text = QLabel("Flag (status):")
         flag_text.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -636,7 +984,20 @@ class MainWindow(QMainWindow):
         self.monitor_button.clicked.connect(self._show_monitor)
         buttons_row.addWidget(self.dashboard_button)
         buttons_row.addWidget(self.monitor_button)
+
+        # Theme toggle button (sun / moon)
+        self.theme_toggle_button = QPushButton("🌙")
+        self.theme_toggle_button.setCheckable(False)
+        self.theme_toggle_button.setFixedWidth(40)
+        self.theme_toggle_button.setToolTip("Toggle dark / light mode")
+        self.theme_toggle_button.clicked.connect(self._toggle_theme)
+        buttons_row.addWidget(self.theme_toggle_button)
+
         right_layout.addLayout(buttons_row)
+
+        # Apply a soft drop shadow to the right-side container for depth
+        self._apply_card_shadow(self.dashboard_widget)
+        self._apply_card_shadow(self.monitor_widget)
 
         layout.addWidget(right_container, 0, 1, 2, 1)
 
@@ -648,6 +1009,155 @@ class MainWindow(QMainWindow):
         self._sync_timer.setInterval(60_000)  # 60 seconds
         self._sync_timer.timeout.connect(self._sync_to_cloud)
         self._sync_timer.start()
+
+    def _toggle_theme(self) -> None:
+        """Toggle between dark and light stylesheets."""
+        self._dark_mode = not self._dark_mode
+        if self._dark_mode:
+            self.setStyleSheet(self._dark_stylesheet)
+            self.theme_toggle_button.setText("🌙")
+        else:
+            self.setStyleSheet(self._light_stylesheet)
+            self.theme_toggle_button.setText("☀")
+        self._apply_label_theme()
+
+    def _apply_label_theme(self) -> None:
+        """Adjust per-widget label colors to match the current theme."""
+        if self._dark_mode:
+            primary = "#f0f0f0"
+            mono = "#dddddd"
+            monitor_stats = "#f5f5f5"
+        else:
+            primary = "#111111"
+            mono = "#333333"
+            monitor_stats = "#222222"
+
+        # Main value labels
+        self.project_value.setStyleSheet(f"font-weight: 500; color: {primary};")
+        self.dataset_value.setStyleSheet(f"font-weight: 500; color: {primary};")
+        self.base_model_value.setStyleSheet(f"font-weight: 500; color: {primary};")
+        self.camera_label.setStyleSheet(f"font-weight: 500; color: {primary};")
+        # Stats text
+        self.stats_value.setStyleSheet(
+            f"font-family: 'JetBrains Mono', monospace; color: {mono};"
+        )
+        self.monitor_stats_label.setStyleSheet(
+            f"font-family: 'JetBrains Mono', monospace; font-size: 14px; color: {monitor_stats};"
+        )
+
+    def _apply_card_shadow(self, widget: QWidget) -> None:
+        """Apply a subtle drop shadow to a panel-like widget."""
+        effect = QGraphicsDropShadowEffect(self)
+        effect.setBlurRadius(24)
+        effect.setXOffset(0)
+        effect.setYOffset(8)
+        effect.setColor(Qt.black)
+        widget.setGraphicsEffect(effect)
+
+    # ------------------------------------------------------------------
+    # Model browser / download from VisionM backend
+    # ------------------------------------------------------------------
+
+    def _browse_visionm_models(self) -> None:
+        """Show a list of trained models and let the user choose one to save.
+
+        This calls /api/models for the current company/project and opens a
+        dialog where the user can pick a model. Only when they click "Save"
+        do we download /api/models/:id/download into the current directory.
+        """
+        if requests is None:
+            QMessageBox.warning(
+                self,
+                "Network unavailable",
+                "The Python 'requests' package is not available.",
+            )
+            return
+
+        api_base = os.getenv("LOCAL_API_BASE_URL", "").strip()
+        if not api_base:
+            QMessageBox.warning(
+                self,
+                "Missing API URL",
+                "Set LOCAL_API_BASE_URL to your VisionBackend base URL.",
+            )
+            return
+
+        company = os.getenv("LOCAL_COMPANY_NAME", "").strip()
+        project = os.getenv("LOCAL_PROJECT_NAME", "").strip() or self.project_value.text().strip()
+        if not company or not project:
+            QMessageBox.warning(
+                self,
+                "Missing details",
+                "Company or project is not set. Please set LOCAL_COMPANY_NAME and LOCAL_PROJECT_NAME.",
+            )
+            return
+
+        try:
+            # 1) List models for this company + project
+            list_url = api_base.rstrip("/") + "/models"
+            params = {"company": company, "project": project}
+            resp = requests.get(list_url, params=params, timeout=10)
+            resp.raise_for_status()
+            payload = resp.json()
+            models = payload.get("models") or []
+            if not models:
+                QMessageBox.information(
+                    self,
+                    "No models",
+                    "No trained models were found for this company/project.",
+                )
+                return
+
+            # 2) Let the user pick a model to save
+            dlg = ModelSelectionDialog(models, parent=self)
+            if dlg.exec() != QDialog.Accepted or not dlg.selected_model_id:
+                return
+
+            selected_id = dlg.selected_model_id
+            # Find the full model dict (for optional naming/metrics)
+            selected_model = next(
+                (m for m in models if str(m.get("modelId")) == selected_id),
+                None,
+            )
+
+            # 3) Download chosen checkpoint
+            download_url = api_base.rstrip("/") + f"/models/{selected_id}/download"
+            resp = requests.get(download_url, stream=True, timeout=60)
+            resp.raise_for_status()
+
+            # Infer filename from Content-Disposition if present
+            filename: Optional[str] = None
+            cd = resp.headers.get("Content-Disposition")
+            if cd and "filename=" in cd:
+                try:
+                    filename = cd.split("filename=")[-1].strip().strip('"')
+                except Exception:
+                    filename = None
+            if not filename:
+                version = (selected_model or {}).get("modelVersion") or "model"
+                filename = f"{project}_{version}.pt"
+
+            target_path = Path.cwd() / filename
+            with target_path.open("wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+
+            log.info("Downloaded model %s to %s", selected_id, target_path)
+            self._populate_models()
+            QMessageBox.information(
+                self,
+                "Model saved",
+                f"Saved trained model to {target_path.name}",
+            )
+        except Exception as exc:
+            log.exception("Failed to browse/download model from VisionM")
+            QMessageBox.warning(
+                self,
+                "Download failed",
+                f"Could not download model from VisionM: {exc}",
+            )
+
     def _populate_cameras(self) -> None:
         """Deprecated: camera dropdown removed (single-camera mode)."""
         return
@@ -805,8 +1315,14 @@ class MainWindow(QMainWindow):
         return row[0], row[1]
 
     def _update_sync_state(self, last_synced_ts: Optional[str]) -> None:
-        """Update sync_state row after a successful cloud sync."""
-        now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        """Update sync_state row after a successful cloud sync.
+
+        We store timestamps as UTC ISO-8601 with a trailing 'Z'. Use
+        timezone-aware datetimes to avoid deprecated utcnow().
+        """
+        from datetime import UTC
+
+        now_iso = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
         try:
             with sqlite3.connect(self._db_path) as conn:
                 cur = conn.cursor()
@@ -818,6 +1334,34 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             log.error("Failed to update sync_state in SQLite DB: %s", exc)
 
+    def _edge_log(self, level: str, event_type: str, message: str) -> None:
+        """Send a lightweight edge connectivity/sync event to VisionM.
+
+        This is best-effort only; failures are logged but ignored.
+        """
+        if requests is None:
+            return
+
+        api_base = os.getenv("LOCAL_API_BASE_URL", "").strip()
+        if not api_base:
+            return
+
+        company_name = os.getenv("LOCAL_COMPANY_NAME", "").strip() or None
+        shop_id = os.getenv("LOCAL_SHOP_ID", os.uname().nodename)
+
+        try:
+            url = api_base.rstrip("/") + "/local-sync/edge-log"
+            payload = {
+                "company": company_name,
+                "shopId": shop_id,
+                "level": level,
+                "eventType": event_type,
+                "message": message,
+            }
+            requests.post(url, json=payload, timeout=3)
+        except Exception:
+            log.debug("EDGE-LOG failed", exc_info=True)
+
     def _log_episode(self, result: str) -> None:
         ts = datetime.now().isoformat(timespec="seconds")
         episode = {"ts": ts, "result": result}
@@ -825,12 +1369,10 @@ class MainWindow(QMainWindow):
         self._save_episodes_to_file()
         self._insert_episode_db(ts, result)
 
-        # For normal operation, only trigger cloud sync when a defect is detected.
-        # This keeps network traffic focused on the most critical events while the
-        # startup reconciliation handles any accumulated backlog.
-        if result != "defect":
-            return
-
+        # Trigger a cloud sync whenever a new episode is recorded so that
+        # the TRY/VisionM UI updates as soon as local_stats.json is written.
+        # _sync_to_cloud reads from SQLite and only pushes genuinely new
+        # episodes in bounded batches, so repeated calls are safe.
         try:
             self._sync_to_cloud()
         except Exception:
@@ -859,6 +1401,12 @@ class MainWindow(QMainWindow):
             if before_ts == after_ts:
                 break
 
+        # Log that Local came online and reconciliation completed (best-effort).
+        try:
+            self._edge_log("info", "online", "Local app started and reconciliation completed")
+        except Exception:
+            pass
+
     def _sync_to_cloud(self) -> None:
         """Best-effort push of new episodes to the VisionM backend.
 
@@ -884,6 +1432,31 @@ class MainWindow(QMainWindow):
 
         last_synced_ts, _ = self._get_sync_state()
 
+        # If the stored cursor is ahead of all locally known episodes (e.g.
+        # due to a previous bug or clock change), treat it as invalid and
+        # reset. ISO-8601 strings compare correctly in lexicographic order,
+        # so we can compare them directly.
+        if self._episodes and last_synced_ts is not None:
+            try:
+                episode_ts_values = [
+                    e.get("ts")
+                    for e in self._episodes
+                    if isinstance(e, dict) and e.get("ts")
+                ]
+                if episode_ts_values:
+                    max_local_ts = max(episode_ts_values)
+                    if last_synced_ts > max_local_ts:
+                        log.warning(
+                            "SYNC: last_synced_ts=%s is ahead of latest local episode %s; resetting cursor",
+                            last_synced_ts,
+                            max_local_ts,
+                        )
+                        last_synced_ts = None
+                        # Persist reset so subsequent calls see a sane cursor
+                        self._update_sync_state(None)
+            except Exception:
+                log.exception("SYNC: failed to validate last_synced_ts against local episodes")
+
         # Read a bounded batch of unsynced episodes directly from SQLite.
         # This keeps the JSON payload small even if there is a large backlog.
         BATCH_LIMIT = 200
@@ -905,11 +1478,41 @@ class MainWindow(QMainWindow):
             log.error("SYNC: failed to read episodes from SQLite: %s", exc)
             return
 
-        if not rows:
+        new_episodes: list[dict[str, str]] = []
+
+        if rows:
+            # Normal path: take unsynced rows from SQLite
+            new_episodes = [{"ts": ts, "result": result} for (ts, result) in rows]
+        else:
+            # Fallback path: SQLite reports nothing newer, but the in-memory
+            # episode list (backed by local_stats.json) may contain episodes
+            # that were never inserted into the DB (e.g. from older runs).
+            # In that case, scan self._episodes and pick anything newer than
+            # last_synced_ts. The backend upserts on (company, shopId, ts, result)
+            # so sending duplicates is safe.
+            try:
+                candidates = []
+                for e in self._episodes:
+                    if not isinstance(e, dict):
+                        continue
+                    ts = e.get("ts")
+                    result = e.get("result")
+                    if not ts or result not in ("good", "defect"):
+                        continue
+                    if last_synced_ts is not None and not (ts > last_synced_ts):
+                        continue
+                    candidates.append({"ts": ts, "result": result})
+
+                # Sort by timestamp and respect batch limit
+                candidates.sort(key=lambda ep: ep["ts"])
+                if candidates:
+                    new_episodes = candidates[:BATCH_LIMIT]
+            except Exception:
+                log.exception("SYNC: failed to build JSON-based fallback episode batch")
+
+        if not new_episodes:
             log.info("SYNC: no new episodes to sync (last_synced_ts=%s)", last_synced_ts)
             return
-
-        new_episodes = [{"ts": ts, "result": result} for (ts, result) in rows]
 
         payload = {
             "company": company_name or None,
@@ -927,8 +1530,16 @@ class MainWindow(QMainWindow):
                 BATCH_LIMIT,
                 resp.status_code,
             )
+            # Record a connectivity log on success
+            self._edge_log(
+                "info",
+                "sync_ok",
+                f"Synced {len(new_episodes)} episodes (batch limit {BATCH_LIMIT}), status={resp.status_code}",
+            )
         except Exception as exc:
             log.error("Failed to sync episodes to VisionM backend: %s", exc)
+            # Log sync failure as edge event (but don't raise)
+            self._edge_log("error", "sync_error", f"Sync failed: {exc}")
             return
 
         # On success, record the latest timestamp we just tried to sync.
@@ -1150,6 +1761,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._stop_worker()
+        # Stop MJPEG server when window closes (best-effort).
+        stop_stream_server()
         super().closeEvent(event)
 
 
@@ -1161,6 +1774,9 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     app.setApplicationName("Local")
+
+    # Start MJPEG HTTP server (for Edge Device live feed) if enabled.
+    start_stream_server_if_enabled()
 
     window = MainWindow()
     window.showMaximized()

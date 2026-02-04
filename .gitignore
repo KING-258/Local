@@ -1,2 +1,6 @@
 *dist/
 build/
+output*/
+Dataset/
+STH3_YOLO/
+runs/
