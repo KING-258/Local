@@ -4,3 +4,4 @@ output*/
 Dataset/
 STH3_YOLO/
 runs/
+*.txt
