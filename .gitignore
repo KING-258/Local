@@ -5,3 +5,4 @@ Dataset/
 STH3_YOLO/
 runs/
 *.txt
+runs*/
