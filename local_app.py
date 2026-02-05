@@ -297,7 +297,11 @@ class LiveWorker(QThread):
         WIDTH = 1280
         HEIGHT = 720
         TARGET_FPS = 30
-        cap = cv2.VideoCapture("/dev/video0", cv2.CAP_V4L2)    # Very Important Check Cam Index by running v4l2-ctl --list-devices
+        # Very Important Check Cam Index by running v4l2-ctl --list-devices
+        cap = cv2.VideoCapture("/dev/video2", cv2.CAP_V4L2)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture("/dev/video0", cv2.CAP_V4L2)
+            exit
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
