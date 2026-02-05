@@ -1,5 +1,5 @@
 *dist/
-build/
+*build*/
 output*/
 Dataset/
 STH3_YOLO/
