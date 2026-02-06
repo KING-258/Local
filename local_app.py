@@ -56,6 +56,12 @@ try:  # optional dependency for cloud sync
 except Exception:  # pragma: no cover
     requests = None  # type: ignore[assignment]
 
+try:  # optional dependency for Supabase auth / queries
+    from supabase import create_client, Client  # type: ignore[import]
+except Exception:  # pragma: no cover
+    create_client = None  # type: ignore[assignment]
+    Client = object  # type: ignore[assignment]
+
 
 log = logging.getLogger("local_app_monitor")
 
@@ -180,6 +186,31 @@ SUPABASE_ANON_KEY = os.getenv(
     os.getenv("VITE_SUPABASE_PUBLISHABLE_KEY", "sb_publishable_HDUPMB6Rt1veRr5hYAvWvQ__IsZ5CnF"),
 ).strip()
 
+_SUPABASE_CLIENT: Optional[Client] = None
+
+
+def get_supabase_client() -> Client:
+    """Return a cached supabase-py client instance.
+
+    Raises a RuntimeError with a helpful message if supabase-py is not
+    installed or Supabase configuration is missing.
+    """
+    if create_client is None:
+        raise RuntimeError(
+            "The 'supabase-py' package is required for Supabase login. "
+            "Install it with 'pip install supabase-py'."
+        )
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+        raise RuntimeError(
+            "Supabase configuration is missing. Please set LOCAL_SUPABASE_URL and LOCAL_SUPABASE_ANON_KEY."
+        )
+
+    global _SUPABASE_CLIENT
+    if _SUPABASE_CLIENT is None:
+        _SUPABASE_CLIENT = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+    return _SUPABASE_CLIENT
+
+
 # Simple in-memory session holder for this run only
 @dataclass
 class SupabaseSession:
@@ -269,38 +300,29 @@ class LoginDialog(QDialog):
             self.error_label.setText("Email and password are required.")
             return
 
-        if requests is None:
-            QMessageBox.critical(
-                self,
-                "Login error",
-                "The Python 'requests' package is required for Supabase login.",
-            )
-            return
-
-        if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-            QMessageBox.critical(
-                self,
-                "Login error",
-                "Supabase configuration is missing. Please set LOCAL_SUPABASE_URL and LOCAL_SUPABASE_ANON_KEY.",
-            )
-            return
-
         self.error_label.setText("")
         try:
-            url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/token?grant_type=password"
-            headers = {
-                "apikey": SUPABASE_ANON_KEY,
-                "Content-Type": "application/json",
-            }
-            payload = {"email": email, "password": password}
-            resp = requests.post(url, headers=headers, json=payload, timeout=15)
-            if not resp.ok:
-                self.error_label.setText("Login failed. Please check your credentials.")
+            client = get_supabase_client()
+
+            # Prefer modern supabase-py API, fall back to older sign_in if
+            # sign_in_with_password is not available.
+            try:
+                res = client.auth.sign_in_with_password({"email": email, "password": password})
+                session_obj = getattr(res, "session", None) or res
+            except AttributeError:
+                res = client.auth.sign_in(email=email, password=password)
+                session_obj = getattr(res, "session", None) or res
+
+            if session_obj is None:
+                self.error_label.setText("Login failed: no session returned.")
                 return
 
-            data = resp.json()
-            access_token = data.get("access_token")
-            refresh_token = data.get("refresh_token")
+            access_token = getattr(session_obj, "access_token", None)
+            refresh_token = getattr(session_obj, "refresh_token", None)
+            if not access_token and isinstance(session_obj, dict):
+                access_token = session_obj.get("access_token")
+                refresh_token = session_obj.get("refresh_token")
+
             if not access_token:
                 self.error_label.setText("Login failed: access token not returned.")
                 return
@@ -325,21 +347,60 @@ def ensure_supabase_session(parent: Optional[QWidget] = None) -> SupabaseSession
 
 
 def fetch_projects_for_company(company: str, access_token: str) -> list[str]:
-    """Fetch project names for the given company from VisionBackend.
+    """Fetch project names for the given company.
 
-    Uses /api/dashboard/projects. The Supabase JWT is not validated by the
-    backend yet; we send a synthetic workspace_admin identity and rely on the
-    company string for scoping.
+    Preferred source is Supabase (via supabase-py) so that the Local app can
+    authorise and discover projects even when the VisionBackend API is not
+    available. If Supabase lookup fails for any reason, we fall back to the
+    /api/dashboard/projects endpoint on the backend.
     """
-    if requests is None:
-        raise RuntimeError("The 'requests' package is required to fetch projects")
-
     company = (company or "").strip()
     if not company:
         raise RuntimeError(
             "Workspace/company name is empty; cannot fetch projects. "
             "This usually means your Supabase profile is not linked to a workspace."
         )
+
+    # First try via Supabase if supabase-py and configuration are available.
+    client: Optional[Client]
+    try:
+        client = get_supabase_client()
+    except Exception:  # pragma: no cover - fall back to backend
+        client = None
+
+    if client is not None:
+        try:
+            # Resolve company id from companies table
+            resp = client.table("companies").select("id").eq("name", company).execute()
+            rows = getattr(resp, "data", None) or getattr(resp, "data", None)
+            if isinstance(rows, list) and rows:
+                company_id = rows[0].get("id")
+            else:
+                company_id = None
+
+            project_names: list[str] = []
+            if company_id is not None:
+                proj_resp = (
+                    client.table("projects")
+                    .select("name")
+                    .eq("company_id", company_id)
+                    .execute()
+                )
+                proj_rows = getattr(proj_resp, "data", None) or getattr(proj_resp, "data", None)
+                if isinstance(proj_rows, list):
+                    for proj in proj_rows:
+                        name = proj.get("name")
+                        if isinstance(name, str) and name.strip():
+                            project_names.append(name.strip())
+
+            if project_names:
+                return sorted(set(project_names))
+        except Exception:  # pragma: no cover - Supabase project lookup failed
+            log.debug("Supabase project lookup failed; falling back to backend.", exc_info=True)
+
+    # Fallback: use VisionBackend /api/dashboard/projects
+    if requests is None:
+        raise RuntimeError("The 'requests' package is required to fetch projects from the backend")
 
     base = API_BASE_URL
     if not base:
@@ -380,44 +441,28 @@ def fetch_company_from_supabase(access_token: str) -> str:
     Returns the company name string used by VisionM (e.g. "RuzareInfoTech").
     Raises RuntimeError on failure.
     """
-    if requests is None:
-        raise RuntimeError("The 'requests' package is required to talk to Supabase")
-    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-        raise RuntimeError(
-            "Supabase configuration is missing. Please set LOCAL_SUPABASE_URL and LOCAL_SUPABASE_ANON_KEY."
-        )
+    if not access_token:
+        raise RuntimeError("Access token is required to resolve workspace/company")
 
-    # 1) Get current auth user
-    auth_url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/user"
-    headers = {
-        "apikey": SUPABASE_ANON_KEY,
-        "Authorization": f"Bearer {access_token}",
-    }
-    resp = requests.get(auth_url, headers=headers, timeout=15)
-    if not resp.ok:
-        raise RuntimeError(f"Failed to load Supabase user: {resp.status_code} {resp.text}")
+    client = get_supabase_client()
 
-    user_data = resp.json() or {}
-    user_id = user_data.get("id") or (user_data.get("user") or {}).get("id")
+    # 1) Get current auth user from Supabase
+    user_resp = client.auth.get_user(access_token)
+    user_obj = getattr(user_resp, "user", None) or user_resp
+    user_id = getattr(user_obj, "id", None)
+    if not user_id and isinstance(user_obj, dict):
+        user_id = user_obj.get("id")
     if not user_id:
         raise RuntimeError("Supabase user response did not include an id")
 
     # 2) Look up profile row for this user
-    profiles_url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/profiles"
-    params = {
-        "select": "id,email,role,company_id",
-        "id": f"eq.{user_id}",
-    }
-    prof_headers = {
-        "apikey": SUPABASE_ANON_KEY,
-        "Authorization": f"Bearer {access_token}",
-        "Accept": "application/json",
-    }
-    resp = requests.get(profiles_url, headers=prof_headers, params=params, timeout=15)
-    if not resp.ok:
-        raise RuntimeError(f"Failed to load profile: {resp.status_code} {resp.text}")
-
-    profiles = resp.json() or []
+    prof_resp = (
+        client.table("profiles")
+        .select("id,email,role,company_id")
+        .eq("id", user_id)
+        .execute()
+    )
+    profiles = getattr(prof_resp, "data", None) or getattr(prof_resp, "data", None)
     if not isinstance(profiles, list) or not profiles:
         raise RuntimeError("No profile row found for this user")
     profile = profiles[0]
@@ -426,16 +471,13 @@ def fetch_company_from_supabase(access_token: str) -> str:
         raise RuntimeError("Profile does not have a company_id; user is not linked to a workspace")
 
     # 3) Resolve company name from companies table
-    companies_url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/companies"
-    params = {
-        "select": "name",
-        "id": f"eq.{company_id}",
-    }
-    resp = requests.get(companies_url, headers=prof_headers, params=params, timeout=15)
-    if not resp.ok:
-        raise RuntimeError(f"Failed to load company: {resp.status_code} {resp.text}")
-
-    companies = resp.json() or []
+    comp_resp = (
+        client.table("companies")
+        .select("name")
+        .eq("id", company_id)
+        .execute()
+    )
+    companies = getattr(comp_resp, "data", None) or getattr(comp_resp, "data", None)
     if not isinstance(companies, list) or not companies:
         raise RuntimeError("No company row found for this profile")
     company_name = companies[0].get("name")
@@ -1367,6 +1409,10 @@ class MainWindow(QMainWindow):
         self._sync_timer: Optional[QTimer] = None
         # Guard to prevent overlapping background sync jobs
         self._sync_in_progress: bool = False
+        # Track whether VisionBackend appears reachable; used to enable
+        # an "offline" mode where Supabase login still works even if the
+        # TRY/VisionBackend server is down.
+        self._backend_available: bool = True
 
         # Build full-screen login overlay inspired by the web landing page
         self._build_login_overlay()
@@ -1598,21 +1644,6 @@ class MainWindow(QMainWindow):
 
     def _on_login_clicked(self) -> None:
         """Handle Supabase email/password login from the overlay."""
-        if requests is None:
-            QMessageBox.critical(
-                self,
-                "Login error",
-                "The Python 'requests' package is required for Supabase login.",
-            )
-            return
-        if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-            QMessageBox.critical(
-                self,
-                "Login error",
-                "Supabase configuration is missing. Please set LOCAL_SUPABASE_URL and LOCAL_SUPABASE_ANON_KEY.",
-            )
-            return
-
         email = self.login_email_edit.text().strip()
         password = self.login_password_edit.text()
         if not email or not password:
@@ -1624,17 +1655,26 @@ class MainWindow(QMainWindow):
         self.login_status_label.setText("Signing in...")
 
         try:
-            url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/token?grant_type=password"
-            headers = {"apikey": SUPABASE_ANON_KEY, "Content-Type": "application/json"}
-            payload = {"email": email, "password": password}
-            resp = requests.post(url, headers=headers, json=payload, timeout=15)
-            if not resp.ok:
+            client = get_supabase_client()
+
+            # Prefer modern supabase-py API, fall back to older sign_in if
+            # sign_in_with_password is not available.
+            try:
+                res = client.auth.sign_in_with_password({"email": email, "password": password})
+                session_obj = getattr(res, "session", None) or res
+            except AttributeError:
+                res = client.auth.sign_in(email=email, password=password)
+                session_obj = getattr(res, "session", None) or res
+
+            if session_obj is None:
                 self.login_status_label.setStyleSheet("font-size: 12px; color: #f97373;")
-                self.login_status_label.setText("Login failed. Please check your credentials.")
+                self.login_status_label.setText("Login failed: no session returned.")
                 return
 
-            data = resp.json()
-            access_token = data.get("access_token")
+            access_token = getattr(session_obj, "access_token", None)
+            if not access_token and isinstance(session_obj, dict):
+                access_token = session_obj.get("access_token")
+
             if not access_token:
                 self.login_status_label.setStyleSheet("font-size: 12px; color: #f97373;")
                 self.login_status_label.setText("Login failed: access token not returned.")
@@ -1669,12 +1709,29 @@ class MainWindow(QMainWindow):
         self._load_projects_for_login()
 
     def _load_projects_for_login(self) -> None:
-        """Fetch projects for the resolved company and show selector if needed."""
+        """Fetch projects for the resolved company and show selector if needed.
+
+        If the VisionBackend is not reachable, we fall back to an **offline
+        mode**: the user remains logged in via Supabase, local models (.pt
+        files) and detection stats from local_stats.json / local_stats.db
+        continue to work, and detections will be synced automatically once
+        the backend becomes available again.
+        """
         try:
             projects = fetch_projects_for_company(self._company_name, self._access_token or "")
+            self._backend_available = True
         except Exception as exc:
-            self.login_status_label.setStyleSheet("font-size: 12px; color: #f97373;")
-            self.login_status_label.setText(f"Failed to load projects: {exc}")
+            # Backend is down or unreachable – allow login to succeed and
+            # start the Local app in offline mode.
+            self._backend_available = False
+            self._project_name = "(offline)"
+            self.login_status_label.setStyleSheet("font-size: 12px; color: #e5e7eb;")
+            self.login_status_label.setText(
+                "VisionBackend is not reachable. Starting in offline mode: "
+                "detections will be stored locally and synced when the "
+                "connection is available."
+            )
+            self._finalise_login_and_start()
             return
 
         if not projects:
