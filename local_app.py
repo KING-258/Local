@@ -12,7 +12,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from typing import Optional
-
+os.environ["LOCAL_STREAM_ENABLED"] = "1"
+os.environ["LOCAL_SHOP_ID"] = "Shop1-LineA"
 import cv2
 import numpy as np
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
@@ -38,9 +39,12 @@ from PySide6.QtWidgets import (
     QWidget,
     QStackedWidget,
     QGraphicsDropShadowEffect,
+    QLineEdit,
+    QFormLayout,
 )
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+from dataclasses import dataclass
 
 try:
     import torch  # type: ignore[import]
@@ -149,6 +153,353 @@ class _MJPEGRequestHandler(BaseHTTPRequestHandler):
 
 
 _STREAM_HTTPD: _ThreadedHTTPServer | None = None
+
+# ---------------------------------------------------------------------------
+# Supabase + backend configuration (Local app)
+# ---------------------------------------------------------------------------
+
+# VisionBackend API base URL used by the Local app
+# Fallback to a sensible default if env is not set so .strip() calls are safe.
+API_BASE_URL = (os.getenv("LOCAL_API_BASE_URL") or "http://127.0.0.1:3000/api").strip()
+
+# Optional static workspace/company default; normally we derive this from Supabase
+COMPANY_NAME = os.getenv("LOCAL_COMPANY_NAME") or ""
+SHOP_ID = "Shop1-LineA"
+# Background image for login overlay, expected at ./landing-bg.jpg next to this script
+if hasattr(sys, "_MEIPASS"):
+    BASE_DIR = Path(sys._MEIPASS)
+else:
+    BASE_DIR = Path(__file__).parent
+
+LANDING_BG_PATH = BASE_DIR / "landing-bg.jpg"
+
+# Supabase Auth configuration for login (anon/public key only)
+SUPABASE_URL = os.getenv("LOCAL_SUPABASE_URL", "https://cynoykvmlktoqbmscccu.supabase.co").strip()
+SUPABASE_ANON_KEY = os.getenv(
+    "LOCAL_SUPABASE_ANON_KEY",
+    os.getenv("VITE_SUPABASE_PUBLISHABLE_KEY", "sb_publishable_HDUPMB6Rt1veRr5hYAvWvQ__IsZ5CnF"),
+).strip()
+
+# Simple in-memory session holder for this run only
+@dataclass
+class SupabaseSession:
+    access_token: str
+    refresh_token: Optional[str] = None
+
+
+class LoginDialog(QDialog):
+    """Simple dialog to log in via Supabase (no sign-up).
+
+    Shown on top of the Local app with a dark theme so it feels seamless.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Sign in to VisionM")
+        self.resize(420, 220)
+        self.session: Optional[SupabaseSession] = None
+
+        # Make dialog feel like part of the app (dark theme, no help button)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self.setModal(True)
+        self.setStyleSheet(
+            """
+            QDialog {
+                background-color: #111111;
+                border: none;
+            }
+            QLabel {
+                color: #f5f5f5;
+                border: none;
+                font-size: 13px;
+            }
+            QLineEdit {
+                background-color: #202020;
+                border: none;
+                border-radius: 6px;
+                padding: 4px 8px;
+                color: #f5f5f5;
+            }
+            QDialogButtonBox QPushButton {
+                background-color: #202020;
+                border: none;
+                border-radius: 18px;
+                padding: 6px 14px;
+                color: #f5f5f5;
+                font-weight: 500;
+            }
+            QDialogButtonBox QPushButton:hover {
+                background-color: #2a2a2a;
+            }
+            QDialogButtonBox QPushButton:pressed {
+                background-color: #1e1e1e;
+            }
+            """
+        )
+
+        layout = QVBoxLayout(self)
+
+        info = QLabel("Log in with your VisionM account. New accounts must be created on the web portal.")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        form = QFormLayout()
+        self.email_edit = QLineEdit(self)
+        self.email_edit.setPlaceholderText("you@example.com")
+        self.password_edit = QLineEdit(self)
+        self.password_edit.setEchoMode(QLineEdit.Password)
+        form.addRow("Email:", self.email_edit)
+        form.addRow("Password:", self.password_edit)
+        layout.addLayout(form)
+
+        self.error_label = QLabel("")
+        self.error_label.setStyleSheet("color: #ff6b6b; font-size: 11px;")
+        layout.addWidget(self.error_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def accept(self) -> None:  # type: ignore[override]
+        email = self.email_edit.text().strip()
+        password = self.password_edit.text()
+
+        if not email or not password:
+            self.error_label.setText("Email and password are required.")
+            return
+
+        if requests is None:
+            QMessageBox.critical(
+                self,
+                "Login error",
+                "The Python 'requests' package is required for Supabase login.",
+            )
+            return
+
+        if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+            QMessageBox.critical(
+                self,
+                "Login error",
+                "Supabase configuration is missing. Please set LOCAL_SUPABASE_URL and LOCAL_SUPABASE_ANON_KEY.",
+            )
+            return
+
+        self.error_label.setText("")
+        try:
+            url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/token?grant_type=password"
+            headers = {
+                "apikey": SUPABASE_ANON_KEY,
+                "Content-Type": "application/json",
+            }
+            payload = {"email": email, "password": password}
+            resp = requests.post(url, headers=headers, json=payload, timeout=15)
+            if not resp.ok:
+                self.error_label.setText("Login failed. Please check your credentials.")
+                return
+
+            data = resp.json()
+            access_token = data.get("access_token")
+            refresh_token = data.get("refresh_token")
+            if not access_token:
+                self.error_label.setText("Login failed: access token not returned.")
+                return
+
+            # Session is in-memory only; each app run requires a fresh login.
+            self.session = SupabaseSession(access_token=access_token, refresh_token=refresh_token)
+            super().accept()
+        except Exception as exc:  # pragma: no cover - network / runtime errors
+            self.error_label.setText(f"Login error: {exc}")
+
+
+def ensure_supabase_session(parent: Optional[QWidget] = None) -> SupabaseSession:
+    """Always prompt for a Supabase login for this run.
+
+    We do not reuse any previous session; closing the app means re-login next time.
+    """
+    dlg = LoginDialog(parent)
+    result = dlg.exec()
+    if result != QDialog.Accepted or dlg.session is None:
+        raise RuntimeError("Login was cancelled")
+    return dlg.session
+
+
+def fetch_projects_for_company(company: str, access_token: str) -> list[str]:
+    """Fetch project names for the given company from VisionBackend.
+
+    Uses /api/dashboard/projects. The Supabase JWT is not validated by the
+    backend yet; we send a synthetic workspace_admin identity and rely on the
+    company string for scoping.
+    """
+    if requests is None:
+        raise RuntimeError("The 'requests' package is required to fetch projects")
+
+    company = (company or "").strip()
+    if not company:
+        raise RuntimeError(
+            "Workspace/company name is empty; cannot fetch projects. "
+            "This usually means your Supabase profile is not linked to a workspace."
+        )
+
+    base = API_BASE_URL
+    if not base:
+        raise RuntimeError("LOCAL_API_BASE_URL / API_BASE_URL is not configured")
+
+    url = base.rstrip("/") + "/dashboard/projects"
+    headers = {
+        "X-User-Id": "local-edge-client",       # synthetic ID for this Local instance
+        "X-User-Role": "workspace_admin",       # role that can view projects
+        "X-User-Company": company,               # workspace/company name from Supabase profile
+    }
+    resp = requests.get(url, params={"company": company}, headers=headers, timeout=15)
+    if not resp.ok:
+        raise RuntimeError(f"Failed to fetch projects: {resp.status_code} {resp.text}")
+
+    data = resp.json()
+    raw_projects = data.get("projects") or []
+    names: list[str] = []
+    for proj in raw_projects:
+        if not isinstance(proj, dict):
+            continue
+        name = proj.get("project")
+        if isinstance(name, str) and name.strip():
+            names.append(name.strip())
+
+    # Deduplicate and sort for stable display
+    return sorted(set(names))
+
+
+def fetch_company_from_supabase(access_token: str) -> str:
+    """Derive the workspace/company name for the logged-in user via Supabase.
+
+    Flow:
+      1) GET /auth/v1/user to obtain the current user's id
+      2) GET /rest/v1/profiles?id=eq.<id> to read company_id
+      3) GET /rest/v1/companies?id=eq.<company_id> to read company name
+
+    Returns the company name string used by VisionM (e.g. "RuzareInfoTech").
+    Raises RuntimeError on failure.
+    """
+    if requests is None:
+        raise RuntimeError("The 'requests' package is required to talk to Supabase")
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+        raise RuntimeError(
+            "Supabase configuration is missing. Please set LOCAL_SUPABASE_URL and LOCAL_SUPABASE_ANON_KEY."
+        )
+
+    # 1) Get current auth user
+    auth_url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/user"
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {access_token}",
+    }
+    resp = requests.get(auth_url, headers=headers, timeout=15)
+    if not resp.ok:
+        raise RuntimeError(f"Failed to load Supabase user: {resp.status_code} {resp.text}")
+
+    user_data = resp.json() or {}
+    user_id = user_data.get("id") or (user_data.get("user") or {}).get("id")
+    if not user_id:
+        raise RuntimeError("Supabase user response did not include an id")
+
+    # 2) Look up profile row for this user
+    profiles_url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/profiles"
+    params = {
+        "select": "id,email,role,company_id",
+        "id": f"eq.{user_id}",
+    }
+    prof_headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+    }
+    resp = requests.get(profiles_url, headers=prof_headers, params=params, timeout=15)
+    if not resp.ok:
+        raise RuntimeError(f"Failed to load profile: {resp.status_code} {resp.text}")
+
+    profiles = resp.json() or []
+    if not isinstance(profiles, list) or not profiles:
+        raise RuntimeError("No profile row found for this user")
+    profile = profiles[0]
+    company_id = profile.get("company_id")
+    if not company_id:
+        raise RuntimeError("Profile does not have a company_id; user is not linked to a workspace")
+
+    # 3) Resolve company name from companies table
+    companies_url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/companies"
+    params = {
+        "select": "name",
+        "id": f"eq.{company_id}",
+    }
+    resp = requests.get(companies_url, headers=prof_headers, params=params, timeout=15)
+    if not resp.ok:
+        raise RuntimeError(f"Failed to load company: {resp.status_code} {resp.text}")
+
+    companies = resp.json() or []
+    if not isinstance(companies, list) or not companies:
+        raise RuntimeError("No company row found for this profile")
+    company_name = companies[0].get("name")
+    if not company_name or not isinstance(company_name, str):
+        raise RuntimeError("Company row did not include a valid name")
+
+    return company_name.strip()
+
+
+class ProjectSelectionDialog(QDialog):
+    """Dialog to let the user choose a project for this Local client."""
+
+    def __init__(self, projects: list[str], parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Select VisionM project")
+        self.resize(420, 260)
+        self.selected_project: Optional[str] = None
+
+        layout = QVBoxLayout(self)
+
+        label = QLabel(
+            f"Select a project for company '{COMPANY_NAME}'. This Local client will use this project "
+            "for models and dashboards."
+        )
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        self.list_widget = QListWidget(self)
+        for name in projects:
+            self.list_widget.addItem(QListWidgetItem(name))
+        layout.addWidget(self.list_widget)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_accept(self) -> None:
+        row = self.list_widget.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "No selection", "Please select a project.")
+            return
+        item = self.list_widget.item(row)
+        self.selected_project = item.text()
+        self.accept()
+
+
+def ensure_project_selection(access_token: str, parent: Optional[QWidget] = None) -> str:
+    """Ensure a project is selected for this Local app run.
+
+    If only one project exists, it is used automatically. Otherwise a dialog is shown.
+    """
+    projects = fetch_projects_for_company(COMPANY_NAME, access_token)
+    if not projects:
+        raise RuntimeError(f"No projects found for company '{COMPANY_NAME}'.")
+
+    if len(projects) == 1:
+        return projects[0]
+
+    dlg = ProjectSelectionDialog(projects, parent=parent)
+    result = dlg.exec()
+    if result != QDialog.Accepted or not dlg.selected_project:
+        raise RuntimeError("Project selection was cancelled")
+    return dlg.selected_project
 
 
 def start_stream_server_if_enabled() -> None:
@@ -301,7 +652,6 @@ class LiveWorker(QThread):
         cap = cv2.VideoCapture("/dev/video2", cv2.CAP_V4L2)
         if not cap.isOpened():
             cap = cv2.VideoCapture("/dev/video0", cv2.CAP_V4L2)
-            exit
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
@@ -599,8 +949,14 @@ class ModelSelectionDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Local – Live View")
+        self.setWindowTitle("Local  Live View")
         self.resize(1280, 720)
+
+        # Auth / workspace context will be populated after login
+        self._access_token: str | None = None
+        self._company_name: str = COMPANY_NAME  # may be overridden from Supabase profile
+        self._project_name: str = ""
+        self._api_base_url = API_BASE_URL
 
         # Theme stylesheets (dark / light). Buttons stay customized in both.
         self._dark_stylesheet = """
@@ -613,7 +969,7 @@ class MainWindow(QMainWindow):
             }
             QComboBox {
                 background-color: #202020;
-                border: 1px solid #444444;
+                border: none;
                 border-radius: 6px;
                 padding: 4px 8px;
                 color: #f5f5f5;
@@ -630,7 +986,7 @@ class MainWindow(QMainWindow):
             }
             QPushButton {
                 background-color: #202020;
-                border: 1px solid #404040;
+                border: none;
                 border-radius: 20px;
                 padding: 6px 14px;
                 color: #f5f5f5;
@@ -747,7 +1103,7 @@ class MainWindow(QMainWindow):
         self.video_label = QLabel("Live video")
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setMinimumSize(640, 360)
-        self.video_label.setStyleSheet("background-color: #202020; border: 1px solid #404040;")
+        self.video_label.setStyleSheet("background-color: #202020; border: none;")
         self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(self.video_label, 0, 0, 2, 1)
         self.dashboard_widget = QWidget(self)
@@ -757,7 +1113,7 @@ class MainWindow(QMainWindow):
         info_layout.setContentsMargins(18, 18, 18, 18)
         info_layout.setHorizontalSpacing(10)
         info_layout.setVerticalSpacing(8)
-        project_name = os.getenv("LOCAL_PROJECT_NAME", "Nazar Project")
+        project_name = self._project_name or "(no project selected)"
         dataset_name = os.getenv("LOCAL_DATASET_NAME", "Nazar Dataset")
         base_model = os.getenv("LOCAL_BASE_MODEL", "yolov11n")
         self._defect_count = 0
@@ -772,9 +1128,8 @@ class MainWindow(QMainWindow):
         # Local persistence database (episodes + sync metadata)
         self._db_path = Path.cwd() / "local_stats.db"
         self._init_db()
-        # On startup, reconcile any backlog of unsynced episodes in small batches
-        # so that Mongo and the local SQLite database stay in sync.
-        self._drain_unsynced_episodes()
+        # Backlog reconciliation will run after login/project selection when
+        # we know the correct company/workspace for this client.
 
         row = 0
         header = QLabel("SESSION")
@@ -1006,13 +1361,15 @@ class MainWindow(QMainWindow):
         layout.addWidget(right_container, 0, 1, 2, 1)
 
         self._last_detection_time: float | None = None
-        self._start_worker_with_current_model()
 
-        # Optional background sync timer to VisionM backend
-        self._sync_timer = QTimer(self)
-        self._sync_timer.setInterval(60_000)  # 60 seconds
-        self._sync_timer.timeout.connect(self._sync_to_cloud)
-        self._sync_timer.start()
+        # Live pipeline (camera + sync) is started only after login + project selection
+        self._live_started: bool = False
+        self._sync_timer: Optional[QTimer] = None
+        # Guard to prevent overlapping background sync jobs
+        self._sync_in_progress: bool = False
+
+        # Build full-screen login overlay inspired by the web landing page
+        self._build_login_overlay()
 
     def _toggle_theme(self) -> None:
         """Toggle between dark and light stylesheets."""
@@ -1059,7 +1416,387 @@ class MainWindow(QMainWindow):
         widget.setGraphicsEffect(effect)
 
     # ------------------------------------------------------------------
+    # Login overlay (full-screen, web-landing inspired)
+    # ------------------------------------------------------------------
+
+    def _build_login_overlay(self) -> None:
+        """Create a full-window login screen with landing-bg.jpg background.
+
+        This keeps everything in a single window and visually matches the
+        VisionM web landing page (hero text + centered login card).
+        """
+        self.login_overlay = QWidget(self)
+        self.login_overlay.setObjectName("LoginOverlay")
+        self.login_overlay.setGeometry(self.rect())
+        self.login_overlay.setAttribute(Qt.WA_StyledBackground, True)
+
+        bg_path = LANDING_BG_PATH.as_posix() if LANDING_BG_PATH.exists() else ""
+        if bg_path:
+            style = f"""
+            QWidget#LoginOverlay {{
+                background-color: #050816;
+                background-image: url("{bg_path}");
+                background-position: center;
+                background-repeat: no-repeat;
+                background-attachment: fixed;
+                background-size: cover;
+            }}
+            """
+        else:
+            style = """
+            QWidget#LoginOverlay {
+                background-color: #050816;
+            }
+            """
+        self.login_overlay.setStyleSheet(style)
+
+        outer = QVBoxLayout(self.login_overlay)
+        # No outer margins so the background image and content truly fill the window
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addStretch()
+
+        center = QWidget(self.login_overlay)
+        center_layout = QVBoxLayout(center)
+        center_layout.setSpacing(24)
+        center_layout.setAlignment(Qt.AlignCenter)
+
+        hero_title = QLabel(
+            "Manage Your Dataset Projects <span style='color:#7c3aed;'>Efficiently</span>"
+        )
+        hero_title.setTextFormat(Qt.RichText)
+        hero_title.setAlignment(Qt.AlignCenter)
+        hero_title.setStyleSheet(
+            "font-size: 34px; font-weight: 800; color: #f9fafb; letter-spacing: 0.5px;"
+        )
+
+        hero_sub = QLabel(
+            "VisionM helps teams collaborate on computer vision datasets with secure "
+            "project management, workspace controls, and seamless file uploads."
+        )
+        hero_sub.setWordWrap(True)
+        hero_sub.setAlignment(Qt.AlignCenter)
+        hero_sub.setStyleSheet(
+            "font-size: 15px; color: rgba(249,250,251,0.9); max-width: 720px;"
+        )
+
+        card = QWidget(center)
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(32, 28, 32, 28)
+        card_layout.setSpacing(12)
+        card.setStyleSheet(
+            "background-color: rgba(15,23,42,0.92); "
+            "border-radius: 16px; "
+            "border: 1px solid rgba(148,163,184,0.45);"
+        )
+
+        logo = QLabel("VisionM")
+        logo.setAlignment(Qt.AlignCenter)
+        logo.setStyleSheet(
+            "font-size: 24px; font-weight: 700; letter-spacing: 0.08em; color: #a855f7; border: none;"
+        )
+
+        card_title = QLabel("Sign in to continue")
+        card_title.setAlignment(Qt.AlignCenter)
+        card_title.setStyleSheet("font-size: 16px; font-weight: 600; color: #e5e7eb; border: none;")
+
+        hint = QLabel("Use the same email and password as on the VisionM web platform.")
+        hint.setWordWrap(True)
+        hint.setAlignment(Qt.AlignCenter)
+        hint.setStyleSheet("font-size: 12px; color: #9ca3af; border: none;")
+
+        self.login_email_edit = QLineEdit(card)
+        self.login_email_edit.setPlaceholderText("you@example.com")
+        self.login_password_edit = QLineEdit(card)
+        self.login_password_edit.setPlaceholderText("Password")
+        self.login_password_edit.setEchoMode(QLineEdit.Password)
+
+        for w in (self.login_email_edit, self.login_password_edit):
+            w.setStyleSheet(
+                "background-color: rgba(15,23,42,0.9);"
+                "border-radius: 10px;"
+                "border: none;"
+                "padding: 10px 14px;"
+                "min-height: 44px;"
+                "font-size: 15px;"
+                "color: #f9fafb;"
+            )
+
+        self.login_button = QPushButton("Sign In")
+        self.login_button.setCursor(Qt.PointingHandCursor)
+        self.login_button.setStyleSheet(
+            "background-color: #4f46e5; color: white; font-weight: 600; "
+            "border-radius: 999px; padding: 8px 18px;"
+        )
+        self.login_button.clicked.connect(self._on_login_clicked)
+
+        self.login_status_label = QLabel("")
+        self.login_status_label.setWordWrap(True)
+        self.login_status_label.setAlignment(Qt.AlignCenter)
+        self.login_status_label.setStyleSheet("font-size: 12px; color: #f97373;")
+
+        self.project_area = QWidget(card)
+        self.project_area.setVisible(False)
+        project_layout = QVBoxLayout(self.project_area)
+        project_layout.setContentsMargins(0, 8, 0, 0)
+        project_layout.setSpacing(6)
+
+        # Label uses dynamic company name which we update after login
+        self.project_label = QLabel("")
+        self.project_label.setAlignment(Qt.AlignCenter)
+        self.project_label.setStyleSheet("font-size: 12px; color: #e5e7eb;")
+
+        self.project_combo = QComboBox(self.project_area)
+        self.project_combo.setStyleSheet(
+            "background-color: rgba(15,23,42,0.9);"
+            "border-radius: 10px;"
+            "border: none;"
+            "padding: 8px 12px;"
+            "min-height: 40px;"
+            "font-size: 15px;"
+            "color: #f9fafb;"
+        )
+
+        self.project_continue_button = QPushButton("Continue")
+        self.project_continue_button.setCursor(Qt.PointingHandCursor)
+        self.project_continue_button.setStyleSheet(
+            "background-color: #22c55e; color: black; font-weight: 600; "
+            "border-radius: 999px; padding: 6px 16px;"
+        )
+        self.project_continue_button.clicked.connect(self._on_project_continue_clicked)
+
+        project_buttons = QHBoxLayout()
+        project_buttons.setContentsMargins(0, 0, 0, 0)
+        project_buttons.addStretch()
+        project_buttons.addWidget(self.project_continue_button)
+        project_buttons.addStretch()
+
+        project_layout.addWidget(self.project_label)
+        project_layout.addWidget(self.project_combo)
+        project_layout.addLayout(project_buttons)
+
+        card_layout.addWidget(logo)
+        card_layout.addWidget(card_title)
+        card_layout.addWidget(hint)
+        card_layout.addSpacing(4)
+        card_layout.addWidget(self.login_email_edit)
+        card_layout.addWidget(self.login_password_edit)
+        card_layout.addWidget(self.login_button)
+        card_layout.addWidget(self.login_status_label)
+        card_layout.addWidget(self.project_area)
+
+        center_layout.addWidget(hero_title)
+        center_layout.addWidget(hero_sub)
+        center_layout.addSpacing(16)
+        center_layout.addWidget(card)
+
+        outer.addWidget(center, alignment=Qt.AlignCenter)
+        outer.addStretch()
+
+        self.login_overlay.raise_()
+        self.login_overlay.show()
+
+    def _on_login_clicked(self) -> None:
+        """Handle Supabase email/password login from the overlay."""
+        if requests is None:
+            QMessageBox.critical(
+                self,
+                "Login error",
+                "The Python 'requests' package is required for Supabase login.",
+            )
+            return
+        if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+            QMessageBox.critical(
+                self,
+                "Login error",
+                "Supabase configuration is missing. Please set LOCAL_SUPABASE_URL and LOCAL_SUPABASE_ANON_KEY.",
+            )
+            return
+
+        email = self.login_email_edit.text().strip()
+        password = self.login_password_edit.text()
+        if not email or not password:
+            self.login_status_label.setStyleSheet("font-size: 12px; color: #f97373;")
+            self.login_status_label.setText("Email and password are required.")
+            return
+
+        self.login_status_label.setStyleSheet("font-size: 12px; color: #e5e7eb;")
+        self.login_status_label.setText("Signing in...")
+
+        try:
+            url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/token?grant_type=password"
+            headers = {"apikey": SUPABASE_ANON_KEY, "Content-Type": "application/json"}
+            payload = {"email": email, "password": password}
+            resp = requests.post(url, headers=headers, json=payload, timeout=15)
+            if not resp.ok:
+                self.login_status_label.setStyleSheet("font-size: 12px; color: #f97373;")
+                self.login_status_label.setText("Login failed. Please check your credentials.")
+                return
+
+            data = resp.json()
+            access_token = data.get("access_token")
+            if not access_token:
+                self.login_status_label.setStyleSheet("font-size: 12px; color: #f97373;")
+                self.login_status_label.setText("Login failed: access token not returned.")
+                return
+
+            self._access_token = access_token
+            self.login_status_label.setStyleSheet("font-size: 12px; color: #e5e7eb;")
+            self.login_status_label.setText("Logged in. Loading workspace and projects...")
+            self._load_company_and_projects()
+        except Exception as exc:
+            self.login_status_label.setStyleSheet("font-size: 12px; color: #f97373;")
+            self.login_status_label.setText(f"Login error: {exc}")
+
+    def _load_company_and_projects(self) -> None:
+        """Resolve company from Supabase then load projects for that workspace."""
+        try:
+            company = fetch_company_from_supabase(self._access_token or "")
+            self._company_name = company
+            # Also expose workspace to any code that still relies on env vars
+            os.environ["LOCAL_COMPANY_NAME"] = self._company_name
+
+            # Update project label now that we know the workspace
+            if hasattr(self, "project_label") and self.project_label is not None:
+                self.project_label.setText(
+                    f"Select project for company '{self._company_name}'"
+                )
+        except Exception as exc:
+            self.login_status_label.setStyleSheet("font-size: 12px; color: #f97373;")
+            self.login_status_label.setText(f"Failed to determine workspace: {exc}")
+            return
+
+        self._load_projects_for_login()
+
+    def _load_projects_for_login(self) -> None:
+        """Fetch projects for the resolved company and show selector if needed."""
+        try:
+            projects = fetch_projects_for_company(self._company_name, self._access_token or "")
+        except Exception as exc:
+            self.login_status_label.setStyleSheet("font-size: 12px; color: #f97373;")
+            self.login_status_label.setText(f"Failed to load projects: {exc}")
+            return
+
+        if not projects:
+            self.login_status_label.setStyleSheet("font-size: 12px; color: #f97373;")
+            self.login_status_label.setText(
+                f"No projects found for company '{self._company_name}'."
+            )
+            return
+
+        if len(projects) == 1:
+            self._project_name = projects[0]
+            self._finalise_login_and_start()
+            return
+
+        self.project_combo.clear()
+        for name in projects:
+            self.project_combo.addItem(name)
+        self.project_area.setVisible(True)
+        self.login_status_label.setStyleSheet("font-size: 12px; color: #e5e7eb;")
+        self.login_status_label.setText(
+            "Select a project for this Local client and click Continue."
+        )
+
+    def _on_project_continue_clicked(self) -> None:
+        idx = self.project_combo.currentIndex()
+        if idx < 0:
+            QMessageBox.warning(self, "No selection", "Please select a project.")
+            return
+        name = self.project_combo.currentText().strip()
+        if not name:
+            QMessageBox.warning(self, "Invalid selection", "Please select a valid project.")
+            return
+        self._project_name = name
+        self._finalise_login_and_start()
+
+    def _finalise_login_and_start(self) -> None:
+        """Show a loading state and start live pipeline once login + project are set.
+
+        We also populate LOCAL_COMPANY_NAME / LOCAL_PROJECT_NAME so any
+        legacy code or scripts that still read these env vars continue to
+        work without needing a long shell invocation.
+
+        The initial camera startup + first full sync can take a little while,
+        especially when there is a large local backlog. To avoid the app
+        looking "frozen", we keep the full-screen overlay visible with a
+        loading message while this work runs, then hide it when done.
+        """
+        # Keep env in sync with the chosen workspace + project
+        if self._company_name:
+            os.environ["LOCAL_COMPANY_NAME"] = self._company_name
+        if self._project_name:
+            os.environ["LOCAL_PROJECT_NAME"] = self._project_name
+
+        self.project_value.setText(self._project_name or "(no project selected)")
+
+        # Reuse the login overlay as a simple loading screen during startup
+        if hasattr(self, "login_email_edit"):
+            self.login_email_edit.setEnabled(False)
+        if hasattr(self, "login_password_edit"):
+            self.login_password_edit.setEnabled(False)
+        if hasattr(self, "login_button"):
+            self.login_button.setEnabled(False)
+        if hasattr(self, "project_area"):
+            self.project_area.setVisible(False)
+
+        if hasattr(self, "login_status_label") and self.login_status_label is not None:
+            self.login_status_label.setStyleSheet("font-size: 12px; color: #e5e7eb;")
+            self.login_status_label.setText(
+                "Starting camera and syncing local episodes to VisionM...\n"
+                "This may take up to a minute on first run."
+            )
+
+        # Ensure overlay covers the window while heavy initial work runs
+        self.login_overlay.setGeometry(self.rect())
+        self.login_overlay.show()
+        self.login_overlay.raise_()
+
+        # Defer heavy startup work slightly so the UI can paint the loading state
+        QTimer.singleShot(0, self._start_live_pipeline_and_close_overlay)
+
+    def _start_live_pipeline_and_close_overlay(self) -> None:
+        """Wrapper that starts the live pipeline then hides the loading overlay.
+
+        The heavy work (initial sync) runs in a background thread so the UI
+        stays responsive. We keep the overlay visible briefly so the user
+        sees the loading state, then reveal the main UI.
+        """
+        self._start_live_pipeline()
+        if hasattr(self, "login_overlay"):
+            def _hide_overlay() -> None:
+                # Called back on the GUI thread via QTimer
+                self.login_overlay.hide()
+
+            # Give the overlay a short moment to be visible
+            QTimer.singleShot(1500, _hide_overlay)
+
+    def _start_live_pipeline(self) -> None:
+        if self._live_started:
+            return
+        self._live_started = True
+
+        # Start MJPEG HTTP server (if enabled) and spawn live worker + sync timer
+        start_stream_server_if_enabled()
+        self._start_worker_with_current_model()
+
+        # Immediately reconcile any backlog of episodes now that we know the
+        # company/project. The reconciliation itself schedules a background
+        # sync job so the GUI thread is not blocked.
+        try:
+            self._drain_unsynced_episodes()
+        except Exception:
+            log.exception("Initial backlog reconciliation failed")
+
+        # Periodic sync, also in the background
+        self._sync_timer = QTimer(self)
+        self._sync_timer.setInterval(60_000)
+        self._sync_timer.timeout.connect(self._sync_to_cloud_background)
+        self._sync_timer.start()
+
+    # ------------------------------------------------------------------
     # Model browser / download from VisionM backend
+    # ------------------------------------------------------------------
     # ------------------------------------------------------------------
 
     def _browse_visionm_models(self) -> None:
@@ -1077,7 +1814,7 @@ class MainWindow(QMainWindow):
             )
             return
 
-        api_base = os.getenv("LOCAL_API_BASE_URL", "").strip()
+        api_base = self._api_base_url.strip()
         if not api_base:
             QMessageBox.warning(
                 self,
@@ -1086,13 +1823,13 @@ class MainWindow(QMainWindow):
             )
             return
 
-        company = os.getenv("LOCAL_COMPANY_NAME", "").strip()
-        project = os.getenv("LOCAL_PROJECT_NAME", "").strip() or self.project_value.text().strip()
+        company = self._company_name
+        project = self._project_name or self.project_value.text().strip()
         if not company or not project:
             QMessageBox.warning(
                 self,
                 "Missing details",
-                "Company or project is not set. Please set LOCAL_COMPANY_NAME and LOCAL_PROJECT_NAME.",
+                "Company or project is not set. Please ensure login and project selection completed.",
             )
             return
 
@@ -1100,7 +1837,10 @@ class MainWindow(QMainWindow):
             # 1) List models for this company + project
             list_url = api_base.rstrip("/") + "/models"
             params = {"company": company, "project": project}
-            resp = requests.get(list_url, params=params, timeout=10)
+            headers = {}
+            if self._access_token:
+                headers["Authorization"] = f"Bearer {self._access_token}"
+            resp = requests.get(list_url, params=params, headers=headers, timeout=10)
             resp.raise_for_status()
             payload = resp.json()
             models = payload.get("models") or []
@@ -1299,44 +2039,19 @@ class MainWindow(QMainWindow):
             log.error("Failed to insert episode into SQLite DB: %s", exc)
 
     def _get_sync_state(self) -> tuple[Optional[str], Optional[str]]:
-        """Return (last_synced_ts, last_sync_at) from SQLite.
+        """Legacy helper (no-op now that we always send all episodes).
 
-        Both values are ISO-8601 strings or None on error/first run.
+        Kept for compatibility but no longer used.
         """
-        try:
-            with sqlite3.connect(self._db_path) as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    "SELECT last_synced_ts, last_sync_at FROM sync_state WHERE id = 1"
-                )
-                row = cur.fetchone()
-        except Exception as exc:
-            log.error("Failed to read sync_state from SQLite DB: %s", exc)
-            return None, None
-
-        if not row:
-            return None, None
-        return row[0], row[1]
+        return None, None
 
     def _update_sync_state(self, last_synced_ts: Optional[str]) -> None:
-        """Update sync_state row after a successful cloud sync.
+        """Legacy helper (no-op now that we always send all episodes)."""
+        return
 
-        We store timestamps as UTC ISO-8601 with a trailing 'Z'. Use
-        timezone-aware datetimes to avoid deprecated utcnow().
-        """
-        from datetime import UTC
-
-        now_iso = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
-        try:
-            with sqlite3.connect(self._db_path) as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    "UPDATE sync_state SET last_synced_ts = ?, last_sync_at = ? WHERE id = 1",
-                    (last_synced_ts, now_iso),
-                )
-                conn.commit()
-        except Exception as exc:
-            log.error("Failed to update sync_state in SQLite DB: %s", exc)
+    def _reset_sync_cursor(self) -> None:
+        """Legacy helper (no-op) – sync cursor is no longer tracked locally."""
+        return
 
     def _edge_log(self, level: str, event_type: str, message: str) -> None:
         """Send a lightweight edge connectivity/sync event to VisionM.
@@ -1346,12 +2061,12 @@ class MainWindow(QMainWindow):
         if requests is None:
             return
 
-        api_base = os.getenv("LOCAL_API_BASE_URL", "").strip()
+        api_base = self._api_base_url.strip()
         if not api_base:
             return
 
-        company_name = os.getenv("LOCAL_COMPANY_NAME", "").strip() or None
-        shop_id = os.getenv("LOCAL_SHOP_ID", os.uname().nodename)
+        company_name = self._company_name or None
+        shop_id = SHOP_ID
 
         try:
             url = api_base.rstrip("/") + "/local-sync/edge-log"
@@ -1373,183 +2088,155 @@ class MainWindow(QMainWindow):
         self._save_episodes_to_file()
         self._insert_episode_db(ts, result)
 
-        # Trigger a cloud sync whenever a new episode is recorded so that
-        # the TRY/VisionM UI updates as soon as local_stats.json is written.
-        # _sync_to_cloud reads from SQLite and only pushes genuinely new
-        # episodes in bounded batches, so repeated calls are safe.
+        # Trigger a cloud sync in the background whenever a new episode is
+        # recorded so that the VisionM UI updates shortly after local_stats
+        # is written. The actual work runs off the GUI thread, so the UI
+        # remains responsive even if there is network delay.
         try:
-            self._sync_to_cloud()
+            self._sync_to_cloud_background()
         except Exception:
-            # Never let sync errors break the UI loop
-            log.exception("_sync_to_cloud failed after logging episode")
+            # Never let sync scheduling errors break the UI loop
+            log.exception("_sync_to_cloud_background failed after logging episode")
 
     def _drain_unsynced_episodes(self) -> None:
-        """On startup, bring Mongo in sync with the local SQLite episode log.
+        """On startup, push whatever episodes exist in SQLite to the backend.
 
-        We repeatedly call `_sync_to_cloud` in a loop until `last_synced_ts`
-        stops advancing, meaning there are no more unsynced episodes. This is
-        a best-effort operation; any errors are logged and do not block the UI.
+        We no longer track a local "last_synced_ts" cursor; the backend
+        upserts on (company, shopId, ts, result), so resending episodes is
+        safe. This helper is now just a thin wrapper around `_sync_to_cloud`.
         """
         if requests is None:
             return
 
-        api_base = os.getenv("LOCAL_API_BASE_URL", "").strip()
+        api_base = self._api_base_url.strip()
         if not api_base:
             return
 
-        # Limit the number of iterations so we don't block startup forever
-        for _ in range(50):
-            before_ts, _ = self._get_sync_state()
-            self._sync_to_cloud()
-            after_ts, _ = self._get_sync_state()
-            if before_ts == after_ts:
-                break
+        # Run the actual sync in the background so the GUI thread is not
+        # blocked during a large initial upload.
+        self._sync_to_cloud_background()
 
-        # Log that Local came online and reconciliation completed (best-effort).
+        # Log that Local came online and reconciliation was requested
+        # (best-effort; the sync job itself logs its own outcome).
         try:
-            self._edge_log("info", "online", "Local app started and reconciliation completed")
+            self._edge_log("info", "online", "Local app started and reconciliation scheduled")
         except Exception:
             pass
 
-    def _sync_to_cloud(self) -> None:
-        """Best-effort push of new episodes to the VisionM backend.
+    def _sync_to_cloud_background(self) -> None:
+        """Run `_sync_to_cloud` in a background thread to keep the UI responsive."""
+        if requests is None:
+            return
+        if self._sync_in_progress:
+            # Avoid overlapping jobs when timer/events fire quickly
+            log.debug("SYNC: background job already in progress; skipping new request")
+            return
 
-        This uses environment variables for configuration:
+        self._sync_in_progress = True
+        log.info("SYNC: scheduling background sync_to_cloud job")
+
+        def _worker() -> None:
+            try:
+                self._sync_to_cloud()
+            except Exception:
+                # _sync_to_cloud already logs details; this is a safety net
+                log.exception("SYNC: unexpected error in background _sync_to_cloud")
+            finally:
+                # Reset the flag back on the GUI thread
+                def _clear_flag() -> None:
+                    self._sync_in_progress = False
+                QTimer.singleShot(0, _clear_flag)
+
+        threading.Thread(target=_worker, name="sync-to-cloud", daemon=True).start()
+
+    def _sync_to_cloud(self) -> None:
+        """Best-effort push of episodes to the VisionM backend (blocking).
+
+        This method performs the actual sync work and is typically invoked
+        via `_sync_to_cloud_background` so that network and I/O do not block
+        the GUI thread.
+
+        Configuration:
         - LOCAL_API_BASE_URL (e.g. "http://192.168.1.24:3000/api")
         - LOCAL_COMPANY_NAME (must match VisionM workspace/company name)
         - LOCAL_SHOP_ID (identifier for this local client / line)
 
-        Episodes are read in *batches* from SQLite so the HTTP payload stays small
-        and we avoid 413 Payload Too Large errors when there is a backlog.
+        Episodes are read in *batches* from SQLite so the HTTP payload stays
+        small and we avoid 413 Payload Too Large errors when there is a
+        backlog.
         """
-        log.info("SYNC: starting sync_to_cloud")
+        log.info("SYNC: starting sync_to_cloud (blocking)")
         if requests is None:
             # HTTP client not available – skip silently
             return
 
-        api_base = os.getenv("LOCAL_API_BASE_URL", "").strip()
+        api_base = self._api_base_url.strip()
         if not api_base:
             return
 
-        company_name = os.getenv("LOCAL_COMPANY_NAME", "").strip()
-        shop_id = os.getenv("LOCAL_SHOP_ID", os.uname().nodename)
+        # Do not attempt to sync until we know which workspace/company this
+        # Local instance belongs to (i.e. after Supabase login).
+        company_name = (self._company_name or "").strip()
+        if not company_name:
+            log.info("SYNC: skipping because company is not set yet (not logged in)")
+            return
 
-        last_synced_ts, _ = self._get_sync_state()
+        shop_id = SHOP_ID
 
-        # If the stored cursor is ahead of all locally known episodes (e.g.
-        # due to a previous bug or clock change), treat it as invalid and
-        # reset. ISO-8601 strings compare correctly in lexicographic order,
-        # so we can compare them directly.
-        if self._episodes and last_synced_ts is not None:
-            try:
-                episode_ts_values = [
-                    e.get("ts")
-                    for e in self._episodes
-                    if isinstance(e, dict) and e.get("ts")
-                ]
-                if episode_ts_values:
-                    max_local_ts = max(episode_ts_values)
-                    if last_synced_ts > max_local_ts:
-                        log.warning(
-                            "SYNC: last_synced_ts=%s is ahead of latest local episode %s; resetting cursor",
-                            last_synced_ts,
-                            max_local_ts,
-                        )
-                        last_synced_ts = None
-                        # Persist reset so subsequent calls see a sane cursor
-                        self._update_sync_state(None)
-            except Exception:
-                log.exception("SYNC: failed to validate last_synced_ts against local episodes")
-
-        # Read a bounded batch of unsynced episodes directly from SQLite.
-        # This keeps the JSON payload small even if there is a large backlog.
-        BATCH_LIMIT = 200
+        # Always read all episodes from SQLite and let the backend upsert on
+        # (company, shopId, ts, result). This avoids complicated local cursor
+        # logic and keeps behaviour simple when switching workspaces.
         try:
             with sqlite3.connect(self._db_path) as conn:
                 cur = conn.cursor()
-                if last_synced_ts is not None:
-                    cur.execute(
-                        "SELECT ts, result FROM episodes WHERE ts > ? ORDER BY id ASC LIMIT ?",
-                        (last_synced_ts, BATCH_LIMIT),
-                    )
-                else:
-                    cur.execute(
-                        "SELECT ts, result FROM episodes ORDER BY id ASC LIMIT ?",
-                        (BATCH_LIMIT,),
-                    )
+                cur.execute("SELECT ts, result FROM episodes ORDER BY id ASC")
                 rows = cur.fetchall()
         except Exception as exc:
             log.error("SYNC: failed to read episodes from SQLite: %s", exc)
             return
 
-        new_episodes: list[dict[str, str]] = []
+        if not rows:
+            log.info("SYNC: no episodes found in SQLite; nothing to sync")
+            return
 
-        if rows:
-            # Normal path: take unsynced rows from SQLite
-            new_episodes = [{"ts": ts, "result": result} for (ts, result) in rows]
-        else:
-            # Fallback path: SQLite reports nothing newer, but the in-memory
-            # episode list (backed by local_stats.json) may contain episodes
-            # that were never inserted into the DB (e.g. from older runs).
-            # In that case, scan self._episodes and pick anything newer than
-            # last_synced_ts. The backend upserts on (company, shopId, ts, result)
-            # so sending duplicates is safe.
+        # Send episodes in bounded batches to avoid 413 Payload Too Large.
+        BATCH_LIMIT = 200
+        url = api_base.rstrip("/") + "/local-sync/upload"
+        total_sent = 0
+
+        for i in range(0, len(rows), BATCH_LIMIT):
+            chunk = rows[i : i + BATCH_LIMIT]
+            new_episodes = [{"ts": ts, "result": result} for (ts, result) in chunk]
+            payload = {
+                "company": company_name,
+                "shopId": shop_id,
+                "episodes": new_episodes,
+            }
+
             try:
-                candidates = []
-                for e in self._episodes:
-                    if not isinstance(e, dict):
-                        continue
-                    ts = e.get("ts")
-                    result = e.get("result")
-                    if not ts or result not in ("good", "defect"):
-                        continue
-                    if last_synced_ts is not None and not (ts > last_synced_ts):
-                        continue
-                    candidates.append({"ts": ts, "result": result})
+                resp = requests.post(url, json=payload, timeout=5)
+                resp.raise_for_status()
+                total_sent += len(new_episodes)
+                log.info(
+                    "SYNC: posted batch %d-%d of %d episodes (batch size %d), status=%s",
+                    i + 1,
+                    i + len(new_episodes),
+                    len(rows),
+                    len(new_episodes),
+                    resp.status_code,
+                )
+            except Exception as exc:
+                log.error("Failed to sync episodes batch to VisionM backend: %s", exc)
+                # Log sync failure as edge event (but don't raise)
+                self._edge_log("error", "sync_error", f"Sync batch failed: {exc}")
+                return
 
-                # Sort by timestamp and respect batch limit
-                candidates.sort(key=lambda ep: ep["ts"])
-                if candidates:
-                    new_episodes = candidates[:BATCH_LIMIT]
-            except Exception:
-                log.exception("SYNC: failed to build JSON-based fallback episode batch")
-
-        if not new_episodes:
-            log.info("SYNC: no new episodes to sync (last_synced_ts=%s)", last_synced_ts)
-            return
-
-        payload = {
-            "company": company_name or None,
-            "shopId": shop_id,
-            "episodes": new_episodes,
-        }
-
-        try:
-            url = api_base.rstrip("/") + "/local-sync/upload"
-            resp = requests.post(url, json=payload, timeout=5)
-            resp.raise_for_status()
-            log.info(
-                "SYNC: posted %d episodes (batch limit %d), status=%s",
-                len(new_episodes),
-                BATCH_LIMIT,
-                resp.status_code,
-            )
-            # Record a connectivity log on success
-            self._edge_log(
-                "info",
-                "sync_ok",
-                f"Synced {len(new_episodes)} episodes (batch limit {BATCH_LIMIT}), status={resp.status_code}",
-            )
-        except Exception as exc:
-            log.error("Failed to sync episodes to VisionM backend: %s", exc)
-            # Log sync failure as edge event (but don't raise)
-            self._edge_log("error", "sync_error", f"Sync failed: {exc}")
-            return
-
-        # On success, record the latest timestamp we just tried to sync.
-        # Because we query ORDER BY id ASC, the last row is the newest.
-        last_ts = max(e["ts"] for e in new_episodes)
-        self._update_sync_state(last_ts)
+        # Record a connectivity log summarising the multi-batch sync.
+        self._edge_log(
+            "info",
+            "sync_ok",
+            f"Synced {total_sent} episodes in batches of up to {BATCH_LIMIT}",
+        )
 
     def _show_dashboard(self) -> None:
         # Switch stacked widget to Dashboard without resizing window
@@ -1763,6 +2450,11 @@ class MainWindow(QMainWindow):
     def _on_worker_finished(self) -> None:
         self._worker = None
 
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if hasattr(self, "login_overlay") and self.login_overlay.isVisible():
+            self.login_overlay.setGeometry(self.rect())
+
     def closeEvent(self, event) -> None:
         self._stop_worker()
         # Stop MJPEG server when window closes (best-effort).
@@ -1776,12 +2468,14 @@ def main() -> int:
         format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
     )
 
+    if requests is None:
+        logging.error("The 'requests' package is required for login and backend communication.")
+        return 1
+
     app = QApplication(sys.argv)
     app.setApplicationName("Local")
 
-    # Start MJPEG HTTP server (for Edge Device live feed) if enabled.
-    start_stream_server_if_enabled()
-
+    # Single window: MainWindow always starts on the full-screen login overlay.
     window = MainWindow()
     window.showMaximized()
 

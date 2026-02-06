@@ -1,62 +1,56 @@
-import os
-import cv2
 from ultralytics import YOLO
 
-# ---------------- USER CONFIG ---------------- #
-MODEL_PATH = "./best.pt"                 # path to your .pt model
-INPUT_DIR = "/home/king/check"           # folder with images to check
-OUTPUT_DIR = "./output"                  # results folder
-
-CONF_THRESHOLD = 0.5                   # defect confidence threshold
-SAVE_ANNOTATED = True                  # save images with boxes drawn
-# --------------------------------------------- #
-
-
-def is_image(fname):
-    return fname.lower().endswith((".jpg", ".png", ".jpeg", ".bmp"))
+# -------- USER CONFIG -------- #
+MODEL_PATH = "./defect-CTS6U.pt"
+DATA_YAML = "/home/king/Downloads/CTS6U_augmented_dataset/CTS6U_dataset_augmented/data.yaml"
+IMG_SIZE = 640
+CONF = 0.25
+IOU = 0.5
+# ----------------------------- #
 
 
 def main():
-    # Load model
-    print(f"Loading model: {MODEL_PATH}")
+
+    print("Loading model...")
     model = YOLO(MODEL_PATH)
 
-    defect_dir = os.path.join(OUTPUT_DIR, "defect")
-    ok_dir = os.path.join(OUTPUT_DIR, "ok")
+    print("Running validation...\n")
 
-    os.makedirs(defect_dir, exist_ok=True)
-    os.makedirs(ok_dir, exist_ok=True)
+    metrics = model.val(
+        data=DATA_YAML,
+        imgsz=IMG_SIZE,
+        conf=CONF,
+        iou=IOU,
+        split="val",
+        verbose=False
+    )
 
-    images = [f for f in os.listdir(INPUT_DIR) if is_image(f)]
-    print(f"Found {len(images)} images")
+    names = model.names
+    nc = metrics.box.nc  # number of classes
 
-    for img_name in images:
-        img_path = os.path.join(INPUT_DIR, img_name)
-        img = cv2.imread(img_path)
+    print("\n=========== CLASS-WISE METRICS ===========\n")
 
-        results = model(img, conf=CONF_THRESHOLD, verbose=False)
+    for i in range(nc):
 
-        detected = False
+        # Returns: p, r, ap50, ap50-95
+        p, r, ap50, ap5095 = metrics.box.class_result(i)
 
-        for r in results:
-            if r.boxes is not None and len(r.boxes) > 0:
-                detected = True
-                if SAVE_ANNOTATED:
-                    img = r.plot()
-                break
+        name = names[i]
 
-        if detected:
-            out_path = os.path.join(defect_dir, img_name)
-        else:
-            out_path = os.path.join(ok_dir, img_name)
+        print(f"Class {i} ({name})")
+        print(f"  Precision   : {p:.4f}")
+        print(f"  Recall      : {r:.4f}")
+        print(f"  mAP@0.5     : {ap50:.4f}")
+        print(f"  mAP@0.5:0.95: {ap5095:.4f}")
+        print("-----------------------------------------")
 
-        cv2.imwrite(out_path, img)
 
-        status = "DEFECT" if detected else "OK"
-        print(f"{img_name}: {status}")
+    print("\n============= OVERALL METRICS =============\n")
 
-    print("\nInference complete.")
-    print(f"Results saved to: {OUTPUT_DIR}")
+    print(f"mAP@0.5     : {metrics.box.map50:.4f}")
+    print(f"mAP@0.5:0.95: {metrics.box.map:.4f}")
+    print(f"Precision   : {metrics.box.mp:.4f}")
+    print(f"Recall      : {metrics.box.mr:.4f}")
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ from pathlib import Path
 # generated according to India Standard Time, independent of OS TZ.
 IST = timezone(timedelta(hours=5, minutes=30))
 
-START_DATE = datetime(2026, 1, 1, tzinfo=IST)
+START_DATE = datetime(2026, 1, 15, tzinfo=IST)
 END_DATE = (datetime.now(IST) - timedelta(days=1)).date()
 MIN_RECORDS_PER_DAY = 180
 MAX_RECORDS_PER_DAY = 230
